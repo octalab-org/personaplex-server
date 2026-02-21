@@ -1,8 +1,8 @@
-# PersonaPlex + Qwen3-TTS Dual GPU Server for Koyeb
+# PersonaPlex + Qwen3-TTS Streaming Dual GPU Server for Koyeb
 # Both services share the same RTX A6000 GPU
 # Nginx reverse proxy routes traffic on port 8998:
 #   /api/chat        → PersonaPlex (WebSocket, port 8999)
-#   /v1/*            → Qwen3-TTS  (REST API, port 8880)
+#   /v1/*            → Qwen3-TTS Streaming (REST+streaming, port 8880)
 #   /health-tts      → Qwen3-TTS health
 #   /*               → PersonaPlex (default)
 
@@ -50,9 +50,11 @@ COPY moshi/ /app/moshi/
 RUN uv venv /app/moshi/.venv --python 3.12
 RUN uv sync
 
-# ─── Qwen3-TTS Setup ─────────────────────────────────────────────────────────
+# ─── Qwen3-TTS Streaming Setup ──────────────────────────────────────────────
 WORKDIR /app/qwen3-tts/
-COPY qwen3-tts/pyproject.toml qwen3-tts/README.md /app/qwen3-tts/
+
+# Copy pyproject.toml first for dependency caching
+COPY qwen3-tts/pyproject.toml /app/qwen3-tts/
 
 # Create Qwen3-TTS virtual environment
 RUN python3 -m venv /app/qwen3-tts/.venv
@@ -64,32 +66,27 @@ RUN /app/qwen3-tts/.venv/bin/pip install --no-cache-dir --upgrade pip setuptools
     torchaudio>=2.0.0 \
     --index-url https://download.pytorch.org/whl/cu121
 
-# Install Qwen3-TTS dependencies
+# Install Qwen3-TTS streaming dependencies
 RUN /app/qwen3-tts/.venv/bin/pip install --no-cache-dir \
-    transformers==4.57.3 \
-    accelerate==1.12.0 \
+    "transformers>=4.57.3" \
+    "accelerate>=1.12.0" \
     librosa \
     soundfile \
-    pydub \
     numpy \
     scipy \
     einops \
     onnxruntime-gpu \
-    fastapi>=0.109.0 \
-    "uvicorn[standard]>=0.27.0" \
-    python-multipart \
-    "pydantic>=2.0.0" \
-    inflect \
-    aiofiles
+    aiohttp \
+    sox
 
 # Try to install flash-attn (optional, may fail on some architectures)
 RUN /app/qwen3-tts/.venv/bin/pip install --no-cache-dir flash-attn --no-build-isolation || true
 
-# Copy Qwen3-TTS application code
-COPY qwen3-tts/api/ /app/qwen3-tts/api/
+# Copy Qwen3-TTS streaming library and server
 COPY qwen3-tts/qwen_tts/ /app/qwen3-tts/qwen_tts/
+COPY qwen3-tts/tts_streaming_server.py /app/qwen3-tts/tts_streaming_server.py
 
-# Install the package in editable mode
+# Install the qwen_tts package in editable mode
 RUN /app/qwen3-tts/.venv/bin/pip install --no-cache-dir -e .
 
 # ─── Nginx + Supervisor Config ────────────────────────────────────────────────
@@ -104,11 +101,10 @@ RUN mkdir -p /root/.cache /tmp/numba_cache
 
 # ─── Runtime ──────────────────────────────────────────────────────────────────
 WORKDIR /app
-ENV NO_TORCH_COMPILE=1
 EXPOSE 8998
 
 # Health check against the nginx reverse proxy
-HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=600s --retries=3 \
     CMD curl -f http://localhost:8998/health || exit 1
 
 # Run supervisord to manage all processes

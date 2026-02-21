@@ -696,10 +696,18 @@ class Qwen3TTSModel:
         # Streaming control
         emit_every_frames: int = 8,
         decode_window_frames: int = 80,
-        overlap_samples: int = 0,
+        overlap_samples: int = 512,
         max_frames: int = 10000,
         # Optimization
         use_optimized_decode: bool = True,
+        # Two-phase streaming: aggressive first chunk
+        first_chunk_emit_every: int = 0,  # 0 = disabled, use emit_every_frames throughout
+        first_chunk_decode_window: int = 48,
+        first_chunk_frames: int = 48,  # Switch to stable after this many frames
+        # Repetition penalty window
+        repetition_penalty_window: int = 100,
+        # Repetition penalty (disabled by default for streaming to avoid vocabulary starvation)
+        repetition_penalty: float = 1.0,
         **kwargs,
     ) -> Generator[Tuple[np.ndarray, int], None, None]:
         """
@@ -721,6 +729,12 @@ class Qwen3TTSModel:
             max_frames: Maximum codec frames to generate.
             use_optimized_decode: Use CUDA graph optimized decode when available (default True).
                                   Call enable_streaming_optimizations() first for best performance.
+            first_chunk_emit_every: Emit interval for first chunk phase (0 = disabled).
+            first_chunk_decode_window: Decode window size for first chunk phase.
+            first_chunk_frames: Switch to stable settings after this many frames.
+            repetition_penalty_window: Only penalize tokens from the last N steps (0 = unlimited).
+            repetition_penalty: Repetition penalty factor (1.0 = disabled). Disabled by default
+                for streaming to avoid vocabulary starvation with the small codec vocabulary.
             **kwargs: Generation parameters (do_sample, top_k, top_p, temperature, etc.)
 
         Yields:
@@ -780,9 +794,11 @@ class Qwen3TTSModel:
         # Extract streaming params, filter to only supported ones
         gen_kwargs = self._merge_generate_kwargs(**kwargs)
         # Only keep params supported by stream_generate_pcm
+        # Note: repetition_penalty is passed as an explicit arg, not through gen_kwargs,
+        # so _merge_generate_kwargs' default (1.05) doesn't override our streaming default (1.0)
         supported_params = {
             "do_sample", "top_k", "top_p", "temperature",
-            "subtalker_dosample", "subtalker_top_k", "subtalker_top_p", "subtalker_temperature"
+            "subtalker_dosample", "subtalker_top_k", "subtalker_top_p", "subtalker_temperature",
         }
         gen_kwargs = {k: v for k, v in gen_kwargs.items() if k in supported_params}
 
@@ -798,9 +814,155 @@ class Qwen3TTSModel:
             overlap_samples=overlap_samples,
             max_frames=max_frames,
             use_optimized_decode=use_optimized_decode,
+            first_chunk_emit_every=first_chunk_emit_every,
+            first_chunk_decode_window=first_chunk_decode_window,
+            first_chunk_frames=first_chunk_frames,
+            repetition_penalty=repetition_penalty,
+            repetition_penalty_window=repetition_penalty_window,
             **gen_kwargs,
         ):
             yield chunk, sr
+
+    @torch.inference_mode()
+    def batch_stream_generate_voice_clone(
+        self,
+        text: List[str],
+        language: Union[str, List[str], None] = None,
+        voice_clone_prompt: Union[List[VoiceClonePromptItem], VoiceClonePromptItem, None] = None,
+        non_streaming_mode: bool = False,
+        # Streaming control
+        emit_every_frames: int = 8,
+        decode_window_frames: int = 80,
+        overlap_samples: int = 512,
+        max_frames: int = 10000,
+        # Optimization
+        use_optimized_decode: bool = True,
+        # Two-phase streaming
+        first_chunk_emit_every: int = 0,
+        first_chunk_decode_window: int = 48,
+        first_chunk_frames: int = 48,
+        # Repetition penalty window
+        repetition_penalty_window: int = 100,
+        # Repetition penalty (disabled by default for streaming to avoid vocabulary starvation)
+        repetition_penalty: float = 1.0,
+        # Batch compaction: remove finished items from GPU tensors
+        compact_finished: bool = True,
+        **kwargs,
+    ) -> Generator[Tuple[List[np.ndarray], int], None, None]:
+        """
+        Batch streaming voice clone speech generation.
+
+        All batch items advance in lockstep through the transformer.
+        Per-item state is maintained for codes, crossfade, repetition penalty,
+        and ref_code context.
+
+        Args:
+            text: List of texts to synthesize (one per batch item).
+            language: Language(s) for synthesis. If str or None, broadcast to all items.
+            voice_clone_prompt: Pre-built VoiceClonePromptItem(s). Single item is broadcast.
+            non_streaming_mode: Whether to use non-streaming text input mode.
+            emit_every_frames: Emit interval for phase 2.
+            decode_window_frames: Decode window for phase 2.
+            overlap_samples: Overlap samples for crossfade.
+            max_frames: Maximum codec frames to generate.
+            use_optimized_decode: Use CUDA graph optimized decode.
+            first_chunk_emit_every: Emit interval for phase 1 (0 = disabled).
+            first_chunk_decode_window: Decode window for phase 1.
+            first_chunk_frames: Switch to phase 2 after this many frames.
+            repetition_penalty_window: Only penalize tokens from the last N steps (0 = unlimited).
+            repetition_penalty: Repetition penalty factor (1.0 = disabled). Disabled by default
+                for streaming to avoid vocabulary starvation with the small codec vocabulary.
+            **kwargs: Generation parameters (do_sample, top_k, top_p, temperature, etc.)
+
+        Yields:
+            Tuple[List[np.ndarray], int]: (chunks_list, sample_rate)
+        """
+        if self.model.tts_model_type != "base":
+            raise ValueError(
+                f"model with tts_model_type={self.model.tts_model_type} "
+                "does not support batch_stream_generate_voice_clone"
+            )
+
+        if not isinstance(text, list) or len(text) < 1:
+            raise ValueError("text must be a non-empty list of strings")
+
+        B = len(text)
+
+        # Broadcast language
+        if language is None:
+            languages = ["Auto"] * B
+        elif isinstance(language, str):
+            languages = [language] * B
+        else:
+            languages = list(language)
+        if len(languages) == 1 and B > 1:
+            languages = languages * B
+        if len(languages) != B:
+            raise ValueError(f"Batch size mismatch: text={B}, language={len(languages)}")
+        self._validate_languages(languages)
+
+        # Broadcast voice_clone_prompt
+        if voice_clone_prompt is None:
+            raise ValueError("voice_clone_prompt is required for batch_stream_generate_voice_clone")
+        if isinstance(voice_clone_prompt, VoiceClonePromptItem):
+            prompt_items = [voice_clone_prompt] * B
+        elif isinstance(voice_clone_prompt, list):
+            prompt_items = voice_clone_prompt
+            if len(prompt_items) == 1 and B > 1:
+                prompt_items = prompt_items * B
+            if len(prompt_items) != B:
+                raise ValueError(f"Batch size mismatch: prompt={len(prompt_items)}, text={B}")
+        else:
+            raise ValueError("voice_clone_prompt must be VoiceClonePromptItem or list of them")
+
+        voice_clone_prompt_dict = self._prompt_items_to_voice_clone_prompt(prompt_items)
+        ref_texts_for_ids = [it.ref_text for it in prompt_items]
+
+        # Tokenize each text
+        input_texts = [self._build_assistant_text(t) for t in text]
+        input_ids = self._tokenize_texts(input_texts)
+
+        # Build per-item ref_ids
+        ref_ids = None
+        if ref_texts_for_ids is not None:
+            ref_ids = []
+            for rt in ref_texts_for_ids:
+                if rt is None or rt == "":
+                    ref_ids.append(None)
+                else:
+                    ref_tok = self._tokenize_texts([self._build_ref_text(rt)])[0]
+                    ref_ids.append(ref_tok)
+
+        # Filter to supported generation params
+        # Note: repetition_penalty is passed as an explicit arg, not through gen_kwargs
+        gen_kwargs = self._merge_generate_kwargs(**kwargs)
+        supported_params = {
+            "do_sample", "top_k", "top_p", "temperature",
+            "subtalker_dosample", "subtalker_top_k", "subtalker_top_p", "subtalker_temperature",
+        }
+        gen_kwargs = {k: v for k, v in gen_kwargs.items() if k in supported_params}
+
+        # Delegate to batch_stream_generate_pcm
+        for chunks_list, sr in self.model.batch_stream_generate_pcm(
+            input_ids=input_ids,
+            ref_ids=ref_ids,
+            voice_clone_prompt=voice_clone_prompt_dict,
+            languages=languages,
+            non_streaming_mode=non_streaming_mode,
+            emit_every_frames=emit_every_frames,
+            decode_window_frames=decode_window_frames,
+            overlap_samples=overlap_samples,
+            max_frames=max_frames,
+            use_optimized_decode=use_optimized_decode,
+            first_chunk_emit_every=first_chunk_emit_every,
+            first_chunk_decode_window=first_chunk_decode_window,
+            first_chunk_frames=first_chunk_frames,
+            repetition_penalty=repetition_penalty,
+            repetition_penalty_window=repetition_penalty_window,
+            compact_finished=compact_finished,
+            **gen_kwargs,
+        ):
+            yield chunks_list, sr
 
     # voice design model
     @torch.no_grad()

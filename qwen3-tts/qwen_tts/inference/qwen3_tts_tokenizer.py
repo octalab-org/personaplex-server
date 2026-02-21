@@ -484,3 +484,41 @@ class Qwen3TTSTokenizer:
         # Convert to numpy and return
         wav = wav_tensor[0].to(torch.float32).detach().cpu().numpy()
         return [wav], int(self.model.get_output_sample_rate())
+
+    def decode_streaming_batch(
+        self,
+        audio_codes: torch.Tensor,
+        use_optimized: bool = True,
+        pad_to_size: Optional[int] = None,
+    ) -> Tuple[List[np.ndarray], int]:
+        """
+        Batched streaming decode for multiple items.
+
+        Same as decode_streaming() but accepts B>1 batch dimension.
+        For B>1, the manual CUDA graph path is skipped and torch.compile
+        with reduce-overhead handles CUDA graphs internally.
+
+        Args:
+            audio_codes: [B, T, num_quantizers] tensor
+            use_optimized: Whether to use optimized path
+            pad_to_size: Pad to fixed frame count for consistent compilation
+
+        Returns:
+            Tuple[List[np.ndarray], int]: (list of B waveforms, sample_rate)
+        """
+        model_type = self.model.get_model_type()
+        if model_type != "qwen3_tts_tokenizer_12hz":
+            return self.decode({"audio_codes": audio_codes})
+
+        assert audio_codes.dim() == 3, f"Expected [B, T, Q], got {audio_codes.shape}"
+
+        wav_tensor = self.model.decode_streaming(
+            audio_codes,
+            use_optimized=use_optimized,
+            pad_to_size=pad_to_size,
+        )
+
+        # wav_tensor is [B, samples]
+        wavs = [wav_tensor[b].to(torch.float32).detach().cpu().numpy()
+                for b in range(wav_tensor.shape[0])]
+        return wavs, int(self.model.get_output_sample_rate())
