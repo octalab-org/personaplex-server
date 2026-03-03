@@ -68,7 +68,7 @@ RUN /app/qwen3-tts/.venv/bin/pip install --no-cache-dir --upgrade pip setuptools
 
 # Install Qwen3-TTS streaming dependencies
 RUN /app/qwen3-tts/.venv/bin/pip install --no-cache-dir \
-    "transformers>=4.57.3" \
+    "transformers>=4.57.3,<5.0.0" \
     "accelerate>=1.12.0" \
     librosa \
     soundfile \
