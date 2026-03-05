@@ -75,11 +75,20 @@ def load_model():
 
     torch.set_float32_matmul_precision("high")
 
+    # Detect best available attention implementation
+    try:
+        import flash_attn  # noqa: F401
+        attn_impl = "flash_attention_2"
+        logger.info("Using FlashAttention2 for inference")
+    except ImportError:
+        attn_impl = "sdpa"
+        logger.info("flash-attn not available, falling back to SDPA (Scaled Dot Product Attention)")
+
     model = Qwen3TTSModel.from_pretrained(
         MODEL_NAME,
         device_map="cuda:0",
         dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation=attn_impl,
     )
 
     elapsed = time.time() - start
