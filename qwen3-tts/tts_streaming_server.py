@@ -95,34 +95,38 @@ def load_model():
     logger.info(f"Model loaded in {elapsed:.1f}s")
 
     if ENABLE_COMPILE:
-        logger.info("Enabling streaming optimizations (torch.compile + CUDA graphs)...")
-        start = time.time()
-        model.enable_streaming_optimizations(
-            decode_window_frames=DECODE_WINDOW,
-            use_compile=True,
-            use_cuda_graphs=False,  # reduce-overhead includes CUDA graphs
-            compile_mode="reduce-overhead",
-        )
-        elapsed = time.time() - start
-        logger.info(f"Optimizations enabled in {elapsed:.1f}s")
+        try:
+            logger.info("Enabling streaming optimizations (torch.compile + CUDA graphs)...")
+            start = time.time()
+            model.enable_streaming_optimizations(
+                decode_window_frames=DECODE_WINDOW,
+                use_compile=True,
+                use_cuda_graphs=False,  # reduce-overhead includes CUDA graphs
+                compile_mode="reduce-overhead",
+            )
+            elapsed = time.time() - start
+            logger.info(f"Optimizations enabled in {elapsed:.1f}s")
 
-        # Warmup run to trigger compilation
-        logger.info("Running warmup generation...")
-        start = time.time()
-        warmup_chunks = list(model.stream_generate_voice_clone(
-            text="Hello, this is a warmup test.",
-            language="English",
-            ref_audio=_generate_silence_wav(),
-            ref_text="Warmup reference.",
-            x_vector_only_mode=True,
-            emit_every_frames=DEFAULT_EMIT_EVERY,
-            decode_window_frames=DECODE_WINDOW,
-            first_chunk_emit_every=DEFAULT_FIRST_CHUNK_EMIT,
-            first_chunk_decode_window=DEFAULT_FIRST_CHUNK_WINDOW,
-            first_chunk_frames=DEFAULT_FIRST_CHUNK_FRAMES,
-        ))
-        elapsed = time.time() - start
-        logger.info(f"Warmup complete in {elapsed:.1f}s ({len(warmup_chunks)} chunks)")
+            # Warmup run to trigger compilation
+            logger.info("Running warmup generation...")
+            start = time.time()
+            warmup_chunks = list(model.stream_generate_voice_clone(
+                text="Hello, this is a warmup test.",
+                language="English",
+                ref_audio=_generate_silence_wav(),
+                ref_text="Warmup reference.",
+                x_vector_only_mode=True,
+                emit_every_frames=DEFAULT_EMIT_EVERY,
+                decode_window_frames=DECODE_WINDOW,
+                first_chunk_emit_every=DEFAULT_FIRST_CHUNK_EMIT,
+                first_chunk_decode_window=DEFAULT_FIRST_CHUNK_WINDOW,
+                first_chunk_frames=DEFAULT_FIRST_CHUNK_FRAMES,
+            ))
+            elapsed = time.time() - start
+            logger.info(f"Warmup complete in {elapsed:.1f}s ({len(warmup_chunks)} chunks)")
+        except Exception as e:
+            logger.warning(f"torch.compile failed, continuing without optimizations: {e}")
+            logger.info("Model will run in eager mode (slower but stable)")
 
     model_ready = True
     logger.info("TTS model ready for streaming inference")
