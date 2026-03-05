@@ -15,6 +15,7 @@
 # limitations under the License.
 import base64
 import io
+import os
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Dict, Generator, List, Optional, Tuple, Union
@@ -259,16 +260,52 @@ class Qwen3TTSModel:
             b64 = b64.split(",", 1)[1]
         return base64.b64decode(b64)
 
+    def _convert_to_wav_bytes(self, audio_bytes: bytes) -> bytes:
+        """Convert any audio format to WAV using ffmpeg as fallback."""
+        import subprocess
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".input", delete=False) as inp:
+            inp.write(audio_bytes)
+            inp_path = inp.name
+        out_path = inp_path + ".wav"
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-y", "-i", inp_path, "-ar", "16000", "-ac", "1", "-f", "wav", out_path],
+                capture_output=True, timeout=30
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"ffmpeg conversion failed: {result.stderr.decode()[:500]}")
+            with open(out_path, "rb") as f:
+                return f.read()
+        finally:
+            for p in [inp_path, out_path]:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
     def _load_audio_to_np(self, x: str) -> Tuple[np.ndarray, int]:
         if self._is_url(x):
             with urllib.request.urlopen(x) as resp:
                 audio_bytes = resp.read()
-            with io.BytesIO(audio_bytes) as f:
-                audio, sr = sf.read(f, dtype="float32", always_2d=False)
+            try:
+                with io.BytesIO(audio_bytes) as f:
+                    audio, sr = sf.read(f, dtype="float32", always_2d=False)
+            except Exception:
+                # soundfile doesn't support this format (e.g. webm/ogg) — convert via ffmpeg
+                wav_bytes = self._convert_to_wav_bytes(audio_bytes)
+                with io.BytesIO(wav_bytes) as f:
+                    audio, sr = sf.read(f, dtype="float32", always_2d=False)
         elif self._is_probably_base64(x):
             wav_bytes = self._decode_base64_to_wav_bytes(x)
-            with io.BytesIO(wav_bytes) as f:
-                audio, sr = sf.read(f, dtype="float32", always_2d=False)
+            try:
+                with io.BytesIO(wav_bytes) as f:
+                    audio, sr = sf.read(f, dtype="float32", always_2d=False)
+            except Exception:
+                # base64 might be webm/ogg, not wav — convert via ffmpeg
+                wav_bytes = self._convert_to_wav_bytes(wav_bytes)
+                with io.BytesIO(wav_bytes) as f:
+                    audio, sr = sf.read(f, dtype="float32", always_2d=False)
         else:
             audio, sr = librosa.load(x, sr=None, mono=True)
 
