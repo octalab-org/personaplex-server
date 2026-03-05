@@ -239,8 +239,12 @@ class Qwen3TTSModel:
     def _is_probably_base64(self, s: str) -> bool:
         if s.startswith("data:audio"):
             return True
-        if ("/" not in s and "\\" not in s) and len(s) > 256:
-            return True
+        # Old check: ("/" not in s) fails because base64 encoding uses '/' chars.
+        # New check: if string is long enough and doesn't look like a URL or file path.
+        if len(s) > 256:
+            # Not a URL and not a file path
+            if not (s.startswith("http://") or s.startswith("https://") or s.startswith("/") or s.startswith("\\") or (len(s) > 2 and s[1] == ":")):
+                return True
         return False
 
     def _is_url(self, s: str) -> bool:
