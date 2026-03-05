@@ -66,7 +66,7 @@ RUN /app/qwen3-tts/.venv/bin/pip install --no-cache-dir --upgrade pip setuptools
     torchaudio>=2.0.0 \
     --index-url https://download.pytorch.org/whl/cu121
 
-# Install Qwen3-TTS streaming dependencies
+# Install Qwen3-TTS streaming dependencies (cache-bust: 2026-03-05)
 RUN /app/qwen3-tts/.venv/bin/pip install --no-cache-dir \
     "transformers>=4.57.3,<5.0.0" \
     "accelerate>=1.12.0" \
@@ -78,6 +78,9 @@ RUN /app/qwen3-tts/.venv/bin/pip install --no-cache-dir \
     onnxruntime-gpu \
     aiohttp \
     sox
+
+# Verify transformers version is 4.x (not 5.x which removed check_model_inputs)
+RUN /app/qwen3-tts/.venv/bin/python3 -c "import transformers; v=transformers.__version__; print(f'transformers={v}'); assert v.startswith('4.'), f'Expected 4.x, got {v}'"
 
 # Try to install flash-attn (optional, may fail on some architectures)
 RUN /app/qwen3-tts/.venv/bin/pip install --no-cache-dir flash-attn --no-build-isolation || true
